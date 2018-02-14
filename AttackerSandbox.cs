@@ -3,6 +3,7 @@
 /// 
 /// All Attackers inherit from this.
 /// </summary>
+using System.Collections.Generic;
 using UnityEngine;
 
 [RequireComponent(typeof(Rigidbody))]
@@ -11,7 +12,6 @@ public class AttackerSandbox : MonoBehaviour {
 	/////////////////////////////////////////////
 	/// Fields
 	/////////////////////////////////////////////
-
 
 	//position in the grid and speed
 	public int XPos { get; set; }
@@ -62,7 +62,22 @@ public class AttackerSandbox : MonoBehaviour {
 
 	//feedback for attacks that do no damage
 	protected ParticleSystem noDamageParticle;
-	private const string NO_DMG_PARTICLE_OBJ = "No damage particle";
+	protected const string NO_DMG_PARTICLE_OBJ = "No damage particle";
+
+
+	//tasks that move pieces
+	protected List<MoveDefenderTask> pushTasks = new List<MoveDefenderTask>();
+	protected List<MoveTask> moveTasks = new List<MoveTask>();
+
+
+	//access to the mini's animation, for those attackers that need to control it via code
+	protected const string MODEL_ORGANIZER = "Model";
+	protected const string MINI_OBJ = "Miniature";
+
+
+
+
+
 
 
 	/////////////////////////////////////////////
@@ -80,6 +95,7 @@ public class AttackerSandbox : MonoBehaviour {
 		Health = baseHealth;
 		Blocked = false;
 		noDamageParticle = transform.Find(NO_DMG_PARTICLE_OBJ).GetComponent<ParticleSystem>();
+
 		RegisterForEvents();
 	}
 
@@ -121,7 +137,7 @@ public class AttackerSandbox : MonoBehaviour {
 	/// <summary>
 	/// Call this when the attacker is being taken off the board to unregister.
 	/// </summary>
-	protected virtual void UnregisterForEvents(){
+	public virtual void UnregisterForEvents(){
 		Services.Events.Unregister<BlockColumnEvent>(BecomeBlocked);
 		Services.Events.Unregister<UnblockColumnEvent>(BecomeBlocked);
 	}
@@ -145,6 +161,8 @@ public class AttackerSandbox : MonoBehaviour {
 	/// </summary>
 	public virtual void PrepareToMove(){
 		currentSpeed = GetSpeed();
+		moveTasks.Clear();
+		pushTasks.Clear();
 	}
 
 
@@ -197,90 +215,71 @@ public class AttackerSandbox : MonoBehaviour {
 		//sanity check; prevent this attacker from trying to move off the board
 		if (ZPos - attemptedMove < 0) attemptedMove = ZPos;
 
-		//if the attacker can't move the entirety of their speed, but could move a shorter distance, allow that
-		//don't go below 1; the rest of the movement system handles that
-		if (attemptedMove > 1){
-			while (attemptedMove > 1){
-				if ((Services.Board.GeneralSpaceQuery(XPos, ZPos - attemptedMove) != SpaceBehavior.ContentType.None && //blocked by something in the space
-					 Services.Board.GeneralSpaceQuery(XPos, ZPos - attemptedMove) != SpaceBehavior.ContentType.Defender) ||
-					(ZPos - attemptedMove <= Services.Board.WallZPos && //blocked by the wall
-					 Services.Board.GetWallDurability(XPos) > 0) ||
-					(ZPos - attemptedMove == 0 && //want to move to last row, but there's a defender holding that position
-					 Services.Board.GeneralSpaceQuery(XPos, 0) == SpaceBehavior.ContentType.Defender) ||
-					(Services.Board.GeneralSpaceQuery(XPos, ZPos - attemptedMove) == SpaceBehavior.ContentType.Defender && //defender is blocked from being pushed
-					 Services.Board.GeneralSpaceQuery(XPos, ZPos - attemptedMove - 1) != SpaceBehavior.ContentType.None) ||
-					(Services.Board.GetSpace(XPos, ZPos - attemptedMove).Block)) { //the space is blocked for movement by, e.g., a rockfall
+		//don't try to move past the wall
+		if (ZPos - attemptedMove <= Services.Board.WallZPos){ //if trying to move south of the wall . . .
+			if (Services.Board.GetWallDurability(XPos) > 0){ //and the wall is standing . . .
+				if (ZPos >= Services.Board.WallZPos){ //and the attacker is north of the wall . . .
+
+					//calculate an attemptedMove that goes up to the wall, but stops there
+					attemptedMove = ZPos - (Services.Board.WallZPos + 1); //+1 because the attacker must stop at the space before the wall
+		
+					Debug.Assert(attemptedMove >= 0);
+				}
+			}
+		}
+		 
+		while (attemptedMove > 0){
+			//if something immobile is in the way, stop
+			if (Services.Board.GeneralSpaceQuery(XPos, ZPos - 1) == SpaceBehavior.ContentType.Attacker ||
+				Services.Board.CheckIfBlock(XPos, ZPos - 1)){
+				attemptedMove = 0;
+			}
+			//if nothing's in the way, move
+			else if (Services.Board.GeneralSpaceQuery(XPos, ZPos - 1) == SpaceBehavior.ContentType.None){
+				GoToSouth(1);
+				MoveTankard();
+				attemptedMove--;
+			}
+
+			//if a defender is in the way, see if the attacker can push them back
+			else if (Services.Board.GeneralSpaceQuery(XPos, ZPos - 1) == SpaceBehavior.ContentType.Defender){
+
+
+				//if the attacker is trying to move to the last space, and there's a defender there, the attacker is stuck
+				if (ZPos - 1 == 0){
+					attemptedMove = 0;
+				}
+
+				//if there's something behind the defender, they can't be pushed
+				else if (Services.Board.GeneralSpaceQuery(XPos, ZPos - 2) != SpaceBehavior.ContentType.None){
+					attemptedMove = 0;
+				}
+
+				//at this point the defender is pushable; do so
+				else {
+					PushDefender(Services.Board.GetThingInSpace(XPos, ZPos - 1));
+					GoToSouth(1);
+					MoveTankard();
 					attemptedMove--;
 				}
-				else break;
 			}
 		}
 
 
-		//if the space the attacker wants to move to is empty, go there.
-		//this moves by spaces in the grid; MoveTask is responsible for having grid positions turned into world coordinates
-		if (Services.Board.GeneralSpaceQuery(XPos, ZPos - attemptedMove) == SpaceBehavior.ContentType.None ||
-			Services.Board.GeneralSpaceQuery(XPos, ZPos - attemptedMove) == SpaceBehavior.ContentType.Defender){
-				
+		if (moveTasks.Count > 0){
+			for (int i = 0; i < moveTasks.Count - 1; i++){
+				moveTasks[i].Then(moveTasks[i + 1]);
+			}
+			Services.Tasks.AddOrderedTask(moveTasks[0]);
+		}
 
-			//is this enemy trying to move through the wall? If so, block the move.
-			if (ZPos - attemptedMove == Services.Board.WallZPos){
-				if (Services.Board.GetWallDurability(XPos) > 0) return;
+
+		if (pushTasks.Count > 0){
+			for (int i = 0; i < pushTasks.Count - 1; i++){
+				pushTasks[i].Then(pushTasks[i + 1]);
 			}
 
-			//last check; if trying to take the last step to the last row, and there's a defender there, block the move
-			if (ZPos - attemptedMove == 0 &&
-				Services.Board.GeneralSpaceQuery(XPos, ZPos - attemptedMove) == SpaceBehavior.ContentType.Defender) return;
-
-
-			//if this attacker is pushing a defender back, move the defender
-			//while the attacker is at it, also push any tankards back so that they end up, if possible,
-			//in a space where they can be used
-
-			int temp = attemptedMove;
-
-			while (temp > 0){
-				if (Services.Board.GeneralSpaceQuery(XPos, ZPos - temp) == SpaceBehavior.ContentType.Defender){
-
-					if (ZPos - attemptedMove - 1 >= 0){ //don't try to push defenders back off the board
-						GameObject defender = Services.Board.GetThingInSpace(XPos, ZPos - temp);
-						Services.Board.TakeThingFromSpace(XPos, ZPos - temp);
-						Services.Board.PutThingInSpace(defender, XPos, ZPos - attemptedMove - 1, SpaceBehavior.ContentType.Defender);
-
-
-						defender.GetComponent<DefenderSandbox>().NewLoc(XPos, ZPos - attemptedMove - 1);
-						Services.Tasks.AddTask(new MoveDefenderTask(defender.GetComponent<Rigidbody>(),
-											   defender.GetComponent<DefenderSandbox>().Speed,
-											   new System.Collections.Generic.List<TwoDLoc>() { new TwoDLoc(XPos, ZPos - temp),
-											   new TwoDLoc(XPos, ZPos - attemptedMove - 1)}));
-					}
-				}
-
-				if (Services.Board.CheckIfTankard(XPos, ZPos - temp) == true){
-					if (ZPos - attemptedMove - 1 >= 0){ //don't try to push tankards back off the board, either
-						Services.Board.GetSpace(XPos, ZPos - temp).Tankard = false;
-						Services.Board.GetSpace(XPos, ZPos - attemptedMove - 1).Tankard = true;
-
-						Transform localTankard = Services.Board.GetTankardInSpace(new TwoDLoc(XPos, ZPos - temp));
-						Debug.Assert(localTankard != null, "Didn't find local tankard.");
-
-						Services.Tasks.AddTask(new MoveObjectTask(localTankard,
-																  new TwoDLoc(XPos, ZPos - temp),
-																  new TwoDLoc(XPos, ZPos - attemptedMove - 1)));
-						localTankard.GetComponent<TankardBehavior>().GridLoc = new TwoDLoc(XPos, ZPos - attemptedMove - 1);
-					}
-				}
-
-				temp--;
-			}
-
-			//OK, not moving through a wall and any defender is out of the way.
-			//Leave the current space, go into the new space, move on-screen, and update this attacker's
-			//understanding of its own position
-			Services.Board.TakeThingFromSpace(XPos, ZPos);
-			Services.Board.PutThingInSpace(gameObject, XPos, ZPos - attemptedMove, SpaceBehavior.ContentType.Attacker);
-			Services.Tasks.AddTask(new MoveTask(transform, XPos, ZPos - attemptedMove, Services.Attackers.MoveSpeed));
-			NewLoc(XPos, ZPos - attemptedMove);
+			Services.Tasks.AddOrderedTask(pushTasks[0]);
 		}
 	}
 
@@ -338,11 +337,58 @@ public class AttackerSandbox : MonoBehaviour {
 		if (Services.Board.GeneralSpaceQuery(XPos + dir, ZPos) == SpaceBehavior.ContentType.None){
 			Services.Board.TakeThingFromSpace(XPos, ZPos);
 			Services.Board.PutThingInSpace(gameObject, XPos + dir, ZPos, SpaceBehavior.ContentType.Attacker);
-			Services.Tasks.AddTask(new MoveTask(transform, XPos + dir, ZPos, Services.Attackers.MoveSpeed));
+			Services.Tasks.AddOrderedTask(new MoveTask(transform, XPos + dir, ZPos, Services.Attackers.MoveSpeed));
 			NewLoc(XPos + dir, ZPos);
+			Services.Rulebook.IncreaseAdvanceDuration();
 			return true;
 		} else return false;
 	}
+
+
+	private void GoToSouth(int speed){
+		Services.Board.TakeThingFromSpace(XPos, ZPos);
+		Services.Board.PutThingInSpace(gameObject, XPos, ZPos - speed, SpaceBehavior.ContentType.Attacker);
+		moveTasks.Add(new MoveTask(transform, XPos, ZPos - speed, Services.Attackers.MoveSpeed));
+		NewLoc(XPos, ZPos - speed);
+		Services.Rulebook.IncreaseAdvanceDuration();
+	}
+
+
+	private void MoveTankard(){
+		if (ZPos == 0) return; //don't try to push tankards off the screen
+
+		if (Services.Board.CheckIfTankard(XPos, ZPos)){
+			if (!Services.Board.CheckIfTankard(XPos, ZPos - 1)){
+				Services.Board.GetSpace(XPos, ZPos).Tankard = false;
+				Services.Board.GetSpace(XPos, ZPos - 1).Tankard = true;
+
+				Transform localTankard = Services.Board.GetTankardInSpace(new TwoDLoc(XPos, ZPos));
+				Debug.Assert(localTankard != null, "Didn't find local tankard.");
+		
+				Services.Tasks.AddTask(new MoveObjectTask(localTankard,
+														  new TwoDLoc(XPos, ZPos),
+														  new TwoDLoc(XPos, ZPos - 1)));
+				localTankard.GetComponent<TankardBehavior>().GridLoc = new TwoDLoc(XPos, ZPos - 1);
+			}
+		}
+	}
+
+
+	private void PushDefender(GameObject defender){
+		Debug.Assert(defender.tag == "Defender", "Trying to push something that's not a defender: " + defender.name);
+
+		Services.Board.TakeThingFromSpace(XPos, ZPos - 1);
+		Services.Board.PutThingInSpace(defender, XPos, ZPos - 2, SpaceBehavior.ContentType.Defender);
+
+
+		defender.GetComponent<DefenderSandbox>().NewLoc(XPos, ZPos - 2);
+
+		pushTasks.Add(new MoveDefenderTask(defender.GetComponent<Rigidbody>(),
+										   Services.Attackers.MoveSpeed,
+										   new System.Collections.Generic.List<TwoDLoc>() { new TwoDLoc(XPos, ZPos - 1),
+										   new TwoDLoc(XPos, ZPos - 2)}));
+	}
+
 
 
 	#endregion movement
@@ -382,6 +428,7 @@ public class AttackerSandbox : MonoBehaviour {
 		Services.Attackers.EliminateAttacker(this);
 		Services.Board.TakeThingFromSpace(XPos, ZPos);
 		Services.Events.Fire(new AttackerDefeatedEvent(this));
+		UnregisterForEvents();
 
 		AttackerFallTask fallTask = new AttackerFallTask(GetComponent<Rigidbody>());
 		EjectAttackerTask throwTask = new EjectAttackerTask(GetComponent<Rigidbody>());
